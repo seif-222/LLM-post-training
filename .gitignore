@@ -1,0 +1,9 @@
+.delegate/
+runs/
+__pycache__/
+.pytest_cache/
+.idea/
+
+# Notes, CLAUDE.md and all Markdown stay local only
+*.md
+notes/
