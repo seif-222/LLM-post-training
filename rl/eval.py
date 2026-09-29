@@ -57,7 +57,7 @@ def completion_lengths(tokens, eos_ids):
 
 
 @torch.no_grad()
-def generate(model, tok, prompts, cfg, batch_size, num_samples=1):
+def generate(model, tok, prompts, cfg, batch_size, num_samples=1, verbose=True):
     """-> list (len(prompts)) of lists (num_samples) of dicts {text, length, truncated}."""
     eos_ids = cfg.eos_token_id if isinstance(cfg.eos_token_id, list) else [cfg.eos_token_id]
     cfg.num_return_sequences = num_samples
@@ -71,7 +71,8 @@ def generate(model, tok, prompts, cfg, batch_size, num_samples=1):
         texts = tok.batch_decode(comp, skip_special_tokens=True)
         rows = [{"text": t, "length": l, "truncated": tr} for t, l, tr in zip(texts, lengths, truncated)]
         out += [rows[j:j + num_samples] for j in range(0, len(rows), num_samples)]
-        print(f"  {min(i + per_batch, len(prompts))}/{len(prompts)}", flush=True)
+        if verbose:
+            print(f"  {min(i + per_batch, len(prompts))}/{len(prompts)}", flush=True)
     return out
 
 
