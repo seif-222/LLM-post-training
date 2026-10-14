@@ -53,14 +53,26 @@ def kl_k3(logp, ref_logp):
     return torch.exp(d) - d - 1
 
 
+def tis_weights(old_logp, sample_logp, cap):
+    """Truncated importance sampling. The answers were sampled by vLLM, whose probabilities
+    differ slightly from the trainer's. Reweight each token by p_trainer / p_vllm, capped at
+    `cap` so one odd token can't blow up the update. Detached: it scales the gradient, it isn't
+    trained. Example, cap 2: p_trainer 0.30 vs p_vllm 0.25 -> 1.2; 0.30 vs 0.10 -> 3.0 -> 2."""
+    return torch.exp(old_logp - sample_logp).clamp(max=cap).detach()
+
+
 def grpo_loss(logp, old_logp, ref_logp, adv, weights, clip_low=0.2, clip_high=0.2,
-              beta=0.0, entropy=None, ent_coef=0.0):
+              beta=0.0, entropy=None, ent_coef=0.0, tis=None):
     """logp/old_logp/ref_logp/weights [B, T], adv [B]. ref_logp may be None when beta == 0.
-    Returns (scalar loss, dict of detached per-token tensors for logging)."""
+    tis [B, T]: optional per-token correction weights (tis_weights) on the policy part.
+    Returns (scalar loss, dict for logging: detached per-token tensors + the loss split into
+    its policy part and its KL part)."""
     A = adv.unsqueeze(1)
     ratio = torch.exp(logp - old_logp)
     clipped_ratio = ratio.clamp(1 - clip_low, 1 + clip_high)
     pg = -torch.min(ratio * A, clipped_ratio * A)
+    if tis is not None:
+        pg = pg * tis
     per_token = pg
     kl = kl_k3(logp, ref_logp) if ref_logp is not None else torch.zeros_like(logp)
     if beta:
@@ -70,4 +82,5 @@ def grpo_loss(logp, old_logp, ref_logp, adv, weights, clip_low=0.2, clip_high=0.
     loss = (weights * per_token).sum()
     # The clipped branch is active when the token already moved far enough in A's direction.
     is_clipped = ((ratio > 1 + clip_high) & (A > 0)) | ((ratio < 1 - clip_low) & (A < 0))
-    return loss, {"kl": kl.detach(), "clipped": is_clipped.float(), "ratio": ratio.detach()}
+    return loss, {"kl": kl.detach(), "clipped": is_clipped.float(), "ratio": ratio.detach(),
+                  "pg_part": (weights * pg).sum().item(), "kl_part": beta * (weights * kl).sum().item()}

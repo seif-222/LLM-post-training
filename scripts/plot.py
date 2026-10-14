@@ -18,7 +18,7 @@ COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
 
 PANELS = [  # (title, [(key, label)], y-limits or None)
     ("Train accuracy (round-0 samples)", [("acc", None)], (0, 1)),
-    ("Greedy eval accuracy (fixed test subset)", [("eval_acc", None)], None),
+    ("Greedy test accuracy (eval_acc; full test unless --eval-n)", [("eval_acc", None)], None),
     ("Wasted groups (all right / all wrong)", [("wasted_frac", "wasted"), ("all_right_frac", "all right"),
                                               ("all_wrong_frac", "all wrong")], (0, 1)),
     ("Answer length (tokens)", [("len", "all"), ("len_right", "right"), ("len_wrong", "wrong")], None),

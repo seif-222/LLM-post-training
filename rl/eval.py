@@ -1,15 +1,17 @@
 """
-Baseline GSM8K evaluation: how good is the model *before* RL, and will RL have a signal?
+GSM8K evaluation of a model, optionally with a trained LoRA adapter.
 
-Two measurements:
+Three measurements:
   greedy  -- one deterministic answer per test question -> accuracy (strict / lenient)
-  sampled -- k samples per question at the RL temperature -> pass@1, pass@k, and the
-             fraction of questions whose k samples have MIXED rewards. Only mixed groups
-             get a non-zero GRPO advantage, so that fraction is the share of each batch
-             that actually produces gradient (PicoChat's was ~0).
+  sampled -- k samples per question at the RL temperature -> pass@1 ... pass@k (unbiased
+             estimator), and the fraction of questions whose k samples have MIXED rewards
+             (only mixed groups give GRPO a gradient)
+  hard    -- (--hard runs/grpo/<run>/hard.jsonl) re-ask the questions a run never solved
+             during training (0/8) and count how many are solved now
 
-Run:  python -m rl.eval --n 200 --k 0          (quick greedy check)
-      python -m rl.eval                        (full test greedy + 256 train questions x 8 samples)
+Run:  python -m rl.eval --n 200 --k 0                              (quick greedy check)
+      python -m rl.eval --adapter runs/grpo/<run>/adapter           (a trained adapter)
+      python -m rl.eval --k 64 --k-n 0 --engine vllm               (pass@1..64 on the full test)
 """
 import argparse
 import json
@@ -19,7 +21,7 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-from rl.data import build_prompt, load_gsm8k
+from rl.data import eos_ids_of, load_gsm8k
 from rl.reward import score
 
 
@@ -41,8 +43,8 @@ def gen_config(model, do_sample, temperature, max_new_tokens):
         temperature=temperature if do_sample else None,
         top_p=1.0, top_k=0, repetition_penalty=1.0,
         max_new_tokens=max_new_tokens,
-        eos_token_id=model.generation_config.eos_token_id,
-        pad_token_id=model.generation_config.pad_token_id,
+        eos_token_id=eos_ids_of(model.generation_config),       # includes <|im_end|> (see rl.data)
+        pad_token_id=model.generation_config.pad_token_id or eos_ids_of(model.generation_config)[0],
     )
 
 
@@ -74,6 +76,25 @@ def generate(model, tok, prompts, cfg, batch_size, num_samples=1, verbose=True):
         if verbose:
             print(f"  {min(i + per_batch, len(prompts))}/{len(prompts)}", flush=True)
     return out
+
+
+def pass_at_k(n, c, k):
+    """Chance that at least one of k tries is right, estimated from n tries with c right
+    (the unbiased estimator from the Codex paper, Chen et al. 2021): 1 - C(n-c, k) / C(n, k).
+    Better than "was one of the first k right": it uses all n tries, so it is less noisy.
+    Examples, n=8: c=0 -> 0; c=8 -> 1; c=1, k=1 -> 1/8; c=1, k=8 -> 1; c=4, k=2 -> 1 - 6/28 = 0.786."""
+    if n - c < k:
+        return 1.0
+    p_all_wrong = 1.0
+    for i in range(k):                                    # C(n-c, k) / C(n, k) as a product
+        p_all_wrong *= (n - c - i) / (n - i)
+    return 1.0 - p_all_wrong
+
+
+def passk_summary(counts, n, ks=None):
+    """counts: right answers per question (out of n tries each) -> {"pass@k": mean over questions}."""
+    ks = ks or [k for k in (1, 2, 4, 8, 16, 32, 64) if k <= n]
+    return {f"pass@{k}": sum(pass_at_k(n, c, k) for c in counts) / len(counts) for k in ks}
 
 
 def summarize_greedy(problems, gens):
@@ -109,6 +130,7 @@ def summarize_sampled(problems, gens, k):
         "all_correct_frac": sum(c == k for c in per_q) / n,
         "all_wrong_frac": sum(c == 0 for c in per_q) / n,
         "n_correct_hist": [per_q.count(i) for i in range(k + 1)],
+        "passk": passk_summary(per_q, k),
         "mean_length": sum(x["length"] for g in gens for x in g) / (n * k),
         "truncated_frac": sum(x["truncated"] for g in gens for x in g) / (n * k),
     }
@@ -121,50 +143,89 @@ def write_jsonl(path, rows):
             f.write(json.dumps(r) + "\n")
 
 
+def load_hard(path):
+    """Unique questions from a run's hard.jsonl (questions whose 8 samples were all wrong)."""
+    seen, out = set(), []
+    for line in open(path):
+        r = json.loads(line)
+        if r["idx"] not in seen:
+            seen.add(r["idx"])
+            out.append({"question": r["question"], "answer": r["answer"], "idx": r["idx"], "step": r["step"]})
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
-    ap.add_argument("--prompt", default="hash", choices=["hash", "boxed"])
-    ap.add_argument("--n", type=int, default=None, help="limit greedy test questions (default: all 1,319)")
+    ap.add_argument("--adapter", default=None, help="a saved LoRA adapter dir (e.g. runs/grpo/<run>/adapter)")
+    ap.add_argument("--engine", default="hf", choices=["hf", "vllm"])
+    ap.add_argument("--prompt", default="boxed", choices=["hash", "boxed", "plain"])
+    ap.add_argument("--n", type=int, default=None, help="limit greedy test questions (default: all 1,319; 0 skips)")
     ap.add_argument("--k", type=int, default=8, help="samples per question for the sampled eval; 0 skips it")
-    ap.add_argument("--k-split", default="train", help="RL trains on train, so the signal check uses train")
-    ap.add_argument("--k-n", type=int, default=256)
+    ap.add_argument("--k-split", default="test", help="test (pass@k) or train (Phase 1's signal check)")
+    ap.add_argument("--k-n", type=int, default=256, help="questions for the sampled eval (0 = the whole split)")
+    ap.add_argument("--hard", default=None, help="a run's hard.jsonl: re-check its never-solved questions")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--max-new-tokens", type=int, default=512)
-    ap.add_argument("--batch-size", type=int, default=128, help="sequences per generate call")
+    ap.add_argument("--batch-size", type=int, default=128, help="HF engine: sequences per generate call")
+    ap.add_argument("--vllm-mem", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
+    from rl.engine import HFEngine, VLLMEngine
     torch.manual_seed(args.seed)
-    out = args.out or os.path.join("runs", "eval", f"{args.model.split('/')[-1]}_{args.prompt}")
+    name = args.model.split("/")[-1] + (f"+{os.path.basename(os.path.dirname(args.adapter.rstrip('/')))}"
+                                        if args.adapter else "")
+    out = args.out or os.path.join("runs", "eval", f"{name}_{args.prompt}")
     os.makedirs(out, exist_ok=True)
-    model, tok = load_model(args.model)
+    if args.engine == "hf":
+        model, tok = load_model(args.model)
+        if args.adapter:
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(model, args.adapter).eval()
+        engine = HFEngine(model, tok, args.max_new_tokens, args.prompt, args.batch_size)
+    else:
+        tok = AutoTokenizer.from_pretrained(args.model)
+        engine = VLLMEngine(None, tok, args.model, args.max_new_tokens, args.prompt, adapter_dir=args.adapter,
+                            gpu_memory_utilization=args.vllm_mem, seed=args.seed)
     results = {"args": vars(args)}
 
-    test = load_gsm8k("test")[:args.n]
-    print(f"[greedy] {len(test)} test questions")
-    t0 = time.time()
-    gens = generate(model, tok, [build_prompt(tok, p["question"], args.prompt) for p in test],
-                    gen_config(model, False, None, args.max_new_tokens), args.batch_size)
-    results["greedy"], recs = summarize_greedy(test, gens)
-    results["greedy"]["seconds"] = round(time.time() - t0, 1)
-    write_jsonl(os.path.join(out, "greedy.jsonl"), recs)
-    print(json.dumps(results["greedy"], indent=2))
+    if args.n != 0:
+        test = load_gsm8k("test")[:args.n]
+        print(f"[greedy] {len(test)} test questions")
+        t0 = time.time()
+        gens = [[g] for g in engine.greedy(test)]
+        results["greedy"], recs = summarize_greedy(test, gens)
+        results["greedy"]["seconds"] = round(time.time() - t0, 1)
+        write_jsonl(os.path.join(out, "greedy.jsonl"), recs)
+        print(json.dumps(results["greedy"], indent=2))
+
+    def sampled(problems, tag):
+        t0 = time.time()
+        ro = engine.sample(problems, args.k, args.temperature)
+        texts, lengths, trunc = ro["texts"], ro["lengths"].tolist(), ro["truncated"].tolist()
+        gens = [[{"text": texts[i * args.k + j], "length": lengths[i * args.k + j],
+                  "truncated": trunc[i * args.k + j]} for j in range(args.k)] for i in range(len(problems))]
+        summary, recs = summarize_sampled(problems, gens, args.k)
+        summary["seconds"] = round(time.time() - t0, 1)
+        write_jsonl(os.path.join(out, f"{tag}.jsonl"), recs)
+        print(f"[{tag}]", json.dumps(summary, indent=2))
+        return summary
 
     if args.k > 0:
-        g = torch.Generator().manual_seed(args.seed)             # fixed question subset, independent of --n
+        g = torch.Generator().manual_seed(1234 if args.k_split == "test" else args.seed)
         pool = load_gsm8k(args.k_split)
-        subset = [pool[i] for i in torch.randperm(len(pool), generator=g)[:args.k_n].tolist()]
+        perm = torch.randperm(len(pool), generator=g).tolist()     # same subset as train_grpo's pass@k
+        subset = [pool[i] for i in (perm[:args.k_n] if args.k_n else range(len(pool)))]
         print(f"[sampled] {len(subset)} {args.k_split} questions x {args.k} samples @ T={args.temperature}")
-        t0 = time.time()
-        gens = generate(model, tok, [build_prompt(tok, p["question"], args.prompt) for p in subset],
-                        gen_config(model, True, args.temperature, args.max_new_tokens),
-                        args.batch_size, num_samples=args.k)
-        results["sampled"], recs = summarize_sampled(subset, gens, args.k)
-        results["sampled"]["seconds"] = round(time.time() - t0, 1)
-        write_jsonl(os.path.join(out, "sampled.jsonl"), recs)
-        print(json.dumps(results["sampled"], indent=2))
+        results["sampled"] = sampled(subset, "sampled")
+
+    if args.hard and args.k > 0:
+        hard = load_hard(args.hard)
+        print(f"[hard] {len(hard)} never-solved questions x {args.k} samples")
+        results["hard"] = sampled(hard, "hard")
+        results["hard"]["solved_now_frac"] = results["hard"][f"pass@{args.k}"]
 
     with open(os.path.join(out, "summary.json"), "w") as f:
         json.dump(results, f, indent=2)
