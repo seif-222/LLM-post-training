@@ -19,7 +19,9 @@ def test_gap_and_tis_path(tmp_path, monkeypatch):
     from rl.rollout import rollout
 
     class HFWithLogp(HFEngine):
-        def sample(self, problems, k, temperature):
+        def sample(self, problems, k, temperature, requests=None):
+            if requests is not None:
+                return super().sample(problems, k, temperature, requests=requests)
             cfg = gen_config(self.model, True, temperature, self.max_new_tokens)
             return rollout(self.model, self.tok, problems, k, cfg, self.prompt_style, 64, sample_logprobs=True)
 

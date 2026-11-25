@@ -84,3 +84,25 @@ def grpo_loss(logp, old_logp, ref_logp, adv, weights, clip_low=0.2, clip_high=0.
     is_clipped = ((ratio > 1 + clip_high) & (A > 0)) | ((ratio < 1 - clip_low) & (A < 0))
     return loss, {"kl": kl.detach(), "clipped": is_clipped.float(), "ratio": ratio.detach(),
                   "pg_part": (weights * pg).sum().item(), "kl_part": beta * (weights * kl).sum().item()}
+
+
+def mask_advantages(advantages, mode="full"):
+    if mode == "full":
+        return advantages
+    if mode == "positive":
+        return advantages.clamp(min=0)
+    if mode == "negative":
+        return advantages.clamp(max=0)
+    raise ValueError(mode)
+
+
+def gradient_diagnostics(total, weighted_kl):
+    """Called on detached accumulated vectors, before clipping; zero ratios are missing."""
+    policy = [t - k for t, k in zip(total, weighted_kl)]
+    def norm(xs):
+        return sum(x.double().square().sum() for x in xs).sqrt().item()
+    p, k, t = norm(policy), norm(weighted_kl), norm(total)
+    dot = sum((a.double() * b.double()).sum() for a, b in zip(policy, weighted_kl)).item()
+    return {"policy_grad_norm": p, "weighted_kl_grad_norm": k, "total_grad_norm": t,
+            "policy_kl_dot": dot, "policy_kl_alignment": dot / (p * k) if p and k else None,
+            "kl_policy_grad_ratio": k / p if p else None}

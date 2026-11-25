@@ -71,7 +71,8 @@ def generate(model, tok, prompts, cfg, batch_size, num_samples=1, verbose=True):
         comp = seqs[:, enc["input_ids"].shape[1]:]           # left padding -> every prompt ends at the same column
         lengths, truncated = completion_lengths(comp, eos_ids)
         texts = tok.batch_decode(comp, skip_special_tokens=True)
-        rows = [{"text": t, "length": l, "truncated": tr} for t, l, tr in zip(texts, lengths, truncated)]
+        rows = [{"text": t, "length": l, "truncated": tr, "token_ids": ids[:l].tolist(),
+                 "finish_reason": "length" if tr else "stop"} for t, l, tr, ids in zip(texts, lengths, truncated, comp)]
         out += [rows[j:j + num_samples] for j in range(0, len(rows), num_samples)]
         if verbose:
             print(f"  {min(i + per_batch, len(prompts))}/{len(prompts)}", flush=True)
@@ -171,7 +172,38 @@ def main():
     ap.add_argument("--vllm-mem", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--manifest", help="pinned question manifest for resumable campaign evaluation")
+    ap.add_argument("--model-revision", default=None)
     args = ap.parse_args()
+    if args.manifest:
+        from rl.campaign import MODEL_REVISION, isolated_rng
+        from rl.evaluation_io import evaluate_manifest
+        from rl.engine import HFEngine, VLLMEngine
+        from rl.checkpointing import file_hash
+        revision = args.model_revision or MODEL_REVISION
+        manifest = json.load(open(args.manifest))
+        if args.out is None:
+            raise ValueError("campaign evaluation requires --out")
+        with isolated_rng():
+            tok = AutoTokenizer.from_pretrained(args.model, revision=revision)
+            tok.padding_side = "left"
+            if args.engine == "vllm":
+                engine = VLLMEngine(None, tok, args.model, args.max_new_tokens, args.prompt,
+                                    adapter_dir=args.adapter, gpu_memory_utilization=args.vllm_mem, revision=revision)
+            else:
+                model = AutoModelForCausalLM.from_pretrained(args.model, revision=revision, dtype=torch.bfloat16).cuda().eval()
+                if args.adapter:
+                    from peft import PeftModel
+                    model = PeftModel.from_pretrained(model, args.adapter).eval()
+                engine = HFEngine(model, tok, args.max_new_tokens, args.prompt, args.batch_size)
+        identity = {"model": args.model, "revision": revision, "prompt": args.prompt,
+                    "max_new_tokens": args.max_new_tokens, "engine": args.engine,
+                    "adapter_sha256": file_hash(os.path.join(args.adapter,"adapter_model.safetensors")) if args.adapter else None}
+        if args.n != 0:
+            evaluate_manifest(engine, manifest, os.path.join(args.out,"greedy"), 1, sampled=False, model_identity=identity)
+        if args.k > 0:
+            evaluate_manifest(engine, manifest, os.path.join(args.out,"sampled"), args.k, model_identity=identity)
+        return
 
     from rl.engine import HFEngine, VLLMEngine
     torch.manual_seed(args.seed)

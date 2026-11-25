@@ -35,7 +35,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from rl.data import load_gsm8k
 from rl.engine import make_engine
 from rl.eval import passk_summary
-from rl.grpo import group_advantages, grpo_loss, tis_weights, token_weights
+from rl.grpo import group_advantages, grpo_loss, tis_weights, token_weights, mask_advantages, gradient_diagnostics, kl_k3
+from rl.campaign import isolated_rng, training_requests, evaluation_requests, finite, config_hash, assert_model_setup
+from rl import checkpointing
 from rl.logprobs import token_logprobs
 from rl.reward import reward, score
 
@@ -65,6 +67,13 @@ def parse_args(argv=None):
     ap.add_argument("--reward-mode", default="strict", choices=["strict", "lenient", "random"],
                     help="random = coin flip per answer (control run); accuracy is still the real one")
     ap.add_argument("--format-weight", type=float, default=0.0)
+    ap.add_argument("--advantage-mode", choices=["full", "positive", "negative"], default="full")
+    ap.add_argument("--campaign-id", default=None)
+    ap.add_argument("--model-revision", default=None)
+    ap.add_argument("--data-revision", default=None)
+    ap.add_argument("--diagnostic-updates", default="25,100,200")
+    ap.add_argument("--max-attempts", type=int, default=220)
+    ap.add_argument("--max-empty-attempts", type=int, default=3)
     # loss
     ap.add_argument("--no-std", action="store_true", help="advantage without dividing by the group std")
     ap.add_argument("--agg", default="seq", choices=["seq", "token", "const"])
@@ -185,28 +194,34 @@ def sample_groups(engine, stream, problems, args, step, files, reward_gen):
     """Dynamic sampling. Returns the kept groups and round-0 statistics (round 0 is an unbiased
     sample of the current model's accuracy; later rounds are not)."""
     Q, K = args.questions, args.k
-    kept, stats = [], {}
+    kept, stats = [], {"generated_tokens": 0, "generated_answers": 0}
     need = Q
     for rnd in range(1 + (0 if args.no_dynamic else args.refill_rounds)):
         n_q = need + (args.oversample if rnd == 0 and not args.no_dynamic else 0)
         idx = stream.next(n_q)
         t0 = time.time()
-        ro = engine.sample([problems[i] for i in idx], K, args.temperature)
-        for qi, group in zip(idx, split_rows(ro, K)):
+        requests = training_requests(args.seed, step, rnd, [problems[i].get("id", i) for i in idx])
+        ro = engine.sample([problems[i] for i in idx], K, args.temperature, requests=requests)
+        stats["generated_tokens"] += int(ro["lengths"].sum())
+        stats["generated_answers"] += len(ro["lengths"])
+        for qi, group, req in zip(idx, split_rows(ro, K), requests):
             gold = problems[qi]["answer"]
             for s in group:
-                s["correct"] = score(s["text"], gold)["correct_strict"]
+                scoring = score(s["text"], gold)
+                s["correct"] = scoring["correct_strict"]
+                s["formatted"] = scoring["source"] in ("boxed", "hash")
                 if args.reward_mode == "random":
                     s["reward"] = float(torch.rand((), generator=reward_gen) < 0.5)
                 else:
                     s["reward"] = reward(s["text"], gold, args.reward_mode, args.format_weight)
-                files["samples"].write(json.dumps({"step": step, "round": rnd, "idx": qi, "reward": s["reward"],
+                files["samples"].write(json.dumps({"step": getattr(args, "current_update", step), "rollout_attempt": step, "round": rnd, "idx": qi, "reward": s["reward"],
                                                    "correct": s["correct"], "length": s["length"],
-                                                   "truncated": s["truncated"], "text": s["text"]}) + "\n")
+                                                   "truncated": s["truncated"], "text": s["text"], "request": req,
+                                                   "token_ids": s["comp_ids"].tolist()}) + "\n")
             n_right = sum(s["correct"] for s in group)
             rs = [s["reward"] for s in group]
             if n_right == 0:
-                files["hard"].write(json.dumps({"step": step, "idx": qi, "question": problems[qi]["question"],
+                files["hard"].write(json.dumps({"step": getattr(args, "current_update", step), "rollout_attempt": step, "idx": qi, "question": problems[qi]["question"],
                                                 "answer": gold, "samples": [s["text"] for s in group]}) + "\n")
             if rnd == 0:
                 stats.setdefault("rewards", []).extend(rs)
@@ -231,7 +246,10 @@ def train_step(model, opt, sched, groups, args, device, pad_id):
     K = args.k
     seqs = [s for g in groups for s in g["seqs"]]
     rewards = torch.tensor([s["reward"] for s in seqs])
-    adv = group_advantages(rewards, K, scale_std=not args.no_std)
+    finite(rewards, "rewards")
+    raw_adv = group_advantages(rewards, K, scale_std=not args.no_std)
+    adv = mask_advantages(raw_adv, args.advantage_mode)
+    finite(adv, "advantages")
     for s, a in zip(seqs, adv):
         s["adv"] = float(a)
     n_seqs, n_tokens = len(seqs), sum(s["length"] for s in seqs)
@@ -256,6 +274,12 @@ def train_step(model, opt, sched, groups, args, device, pad_id):
             "gap", "gap_abs", "gap_kl", "tis_capped")
     sums = {k: 0.0 for k in keys}
     grad_norms = []
+    params = [p for p in model.parameters() if p.requires_grad]
+    before = [p.detach().clone() for p in params]
+    lr_used = opt.param_groups[0]["lr"]
+    diagnostic = getattr(args, "current_update", -1) in {int(x) for x in args.diagnostic_updates.split(",") if x}
+    kl_grad = [torch.zeros_like(p) for p in params] if diagnostic else None
+    diagnostics = {}
     want_top = args.ent_top_p if (args.ent_coef == 0 or args.ent_kind == "top") else None
     for update in range(args.updates_per_batch):
         opt.zero_grad(set_to_none=True)
@@ -271,6 +295,14 @@ def train_step(model, opt, sched, groups, args, device, pad_id):
             ent = out["entropy_top" if args.ent_kind == "top" else "entropy"]
             loss, info = grpo_loss(logp, old, f.get("ref"), torch.tensor([s["adv"] for s in mb], device=device),
                                    w, args.clip_low, args.clip_high, args.beta, ent, args.ent_coef, tis)
+            finite([logp, old, f.get("ref"), loss], "loss inputs")
+            if diagnostic:
+                with isolated_rng():
+                    kl_loss = args.beta * (w * kl_k3(logp, f["ref"])).sum() if args.beta else logp.sum() * 0
+                    grads = torch.autograd.grad(kl_loss, params, retain_graph=True, allow_unused=True)
+                    for target, grad in zip(kl_grad, grads):
+                        if grad is not None:
+                            target.add_(grad.detach())
             loss.backward()
             if update == 0:                                             # log the first pass only
                 m = cm.float()
@@ -287,12 +319,27 @@ def train_step(model, opt, sched, groups, args, device, pad_id):
                     sums["gap_kl"] += ((torch.exp(-d) + d - 1) * m).sum().item()   # k3, vLLM vs trainer
                     if tis is not None:
                         sums["tis_capped"] += ((tis >= args.tis_cap) * m).sum().item()
-        gn = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.grad_clip)
+        finite([p.grad for p in params], "gradient")
+        if diagnostic:
+            diagnostics = gradient_diagnostics([p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p) for p in params], kl_grad)
+        gn = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.grad_clip, error_if_nonfinite=True)
         grad_norms.append(gn.item())
         opt.step()
+        finite([p.detach() for p in params], "updated parameters")
+        finite(opt.state_dict(), "optimizer")
         sched.step()
     stats = {"loss": sums["loss"], "pg_part": sums["pg_part"], "kl_part": sums["kl_part"],
-             "grad_norm": grad_norms[0], "lr": sched.get_last_lr()[0],
+             "grad_norm": grad_norms[0], "lr": lr_used,
+             "grad_clip_active": grad_norms[0] > args.grad_clip,
+             "objective_kl": sums["kl_part"] / args.beta if args.beta else None,
+             "parameter_rms_change": (sum((p.detach() - b).double().square().sum().item() for p, b in zip(params, before)) / sum(p.numel() for p in params)) ** 0.5,
+             "active_positive_answers": int((adv > 0).sum()), "active_negative_answers": int((adv < 0).sum()),
+             "active_positive_tokens": sum(s["length"] for s in seqs if s["adv"] > 0),
+             "active_negative_tokens": sum(s["length"] for s in seqs if s["adv"] < 0),
+             "trained_tokens": n_tokens, "trained_answers": n_seqs,
+             "adv_mean_before": raw_adv.mean().item(), "adv_std_before": raw_adv.std(correction=0).item(),
+             "adv_mean_after": adv.mean().item(), "adv_std_after": adv.std(correction=0).item(),
+             **diagnostics,
              **{k: sums[k] / n_tokens for k in ("kl", "clipped", "entropy", "entropy_top")}}
     stats["clip_frac"] = stats.pop("clipped")
     if any("sample_logp" in s for s in seqs):
@@ -303,14 +350,22 @@ def train_step(model, opt, sched, groups, args, device, pad_id):
 
 
 @torch.no_grad()
-def greedy_eval(engine, model, problems):
+def greedy_eval(engine, model, problems, return_records=False):
     """-> (summary dict, per-question 0/1 list in problem order, for paired comparisons)."""
     model.eval()
     gens = engine.greedy(problems)
     correct = [int(score(g["text"], p["answer"])["correct_strict"]) for g, p in zip(gens, problems)]
-    return {"eval_acc": sum(correct) / len(correct),
-            "eval_len": sum(g["length"] for g in gens) / len(gens),
-            "eval_trunc": sum(g["truncated"] for g in gens) / len(gens)}, correct
+    summary = {"eval_acc": sum(correct) / len(correct),
+               "eval_len": sum(g["length"] for g in gens) / len(gens),
+               "eval_trunc": sum(g["truncated"] for g in gens) / len(gens)}
+    if return_records:
+        requests = evaluation_requests("openai/gsm8k/main/test", [p.get("id", i) for i,p in enumerate(problems)])
+        records = [{"id": p.get("id", i), "question": p["question"], "answer": p["answer"],
+                    **g, **score(g["text"], p["answer"]), "request": req}
+                   for i,(p,g,req) in enumerate(zip(problems,gens,requests))]
+        return summary, correct, records
+    return summary, correct
+
 
 
 @torch.no_grad()
@@ -322,141 +377,215 @@ def passk_eval(engine, model, problems, k, temperature):
     return passk_summary(counts, k)
 
 
-def save_checkpoint(path, model, opt, sched, stream, reward_gen, step, extra):
-    """Write to <path>.tmp, then swap it in, so a crash mid-write never leaves a broken checkpoint."""
-    tmp, old = path + ".tmp", path + ".old"
-    shutil.rmtree(tmp, ignore_errors=True)
-    model.save_pretrained(tmp)
-    torch.save({"opt": opt.state_dict(), "sched": sched.state_dict(), "stream": stream.state_dict(),
-                "reward_gen": reward_gen.get_state(), "step": step,
-                "rng_cpu": torch.get_rng_state(), "rng_cuda": torch.cuda.get_rng_state_all(), **extra},
-               os.path.join(tmp, "state.pt"))
-    shutil.rmtree(old, ignore_errors=True)
-    if os.path.exists(path):
-        os.rename(path, old)
-    os.rename(tmp, path)
-    shutil.rmtree(old, ignore_errors=True)
+def save_checkpoint(path, model, opt, sched, stream, reward_gen, step, extra, commit=None):
+    return checkpointing.save(path, model, opt, sched, stream, reward_gen, step, extra, commit)
 
 
-def load_checkpoint(path, model, opt, sched, stream, reward_gen):
-    if not os.path.exists(path) and os.path.exists(path + ".old"):
-        path = path + ".old"
-    set_peft_model_state_dict(model, load_file(os.path.join(path, "adapter_model.safetensors")))
-    st = torch.load(os.path.join(path, "state.pt"), weights_only=False)
-    opt.load_state_dict(st["opt"])
-    sched.load_state_dict(st["sched"])
-    stream.load_state_dict(st["stream"])
-    reward_gen.set_state(st["reward_gen"])
-    torch.set_rng_state(st["rng_cpu"])
-    torch.cuda.set_rng_state_all(st["rng_cuda"])
-    return st
+def load_checkpoint(path, model, opt, sched, stream, reward_gen, expected_config=None):
+    return checkpointing.load(path, model, opt, sched, stream, reward_gen, expected_config)
 
 
 def trim_logs(out, step):
-    """On resume, drop log lines written after the checkpoint (they will be redone)."""
+    """Preserve raw files, then rebuild the legacy canonical view through the checkpoint."""
     for name, opener in (("metrics.jsonl", open), ("hard.jsonl", open), ("samples.jsonl.gz", gzip.open)):
         p = os.path.join(out, name)
         if not os.path.exists(p):
             continue
+        shutil.copy2(p, p + ".attempt-" + uuid.uuid4().hex)
         with opener(p, "rt") as f:
             keep = [l for l in f if json.loads(l)["step"] <= step]
         with opener(p, "wt") as f:
             f.writelines(keep)
 
 
-def main(argv=None, on_checkpoint=None):
+def main(argv=None, on_checkpoint=None, guard=None, _test_device=None):
     """on_checkpoint: optional callback after every checkpoint (Modal uses it to save its disk)."""
+    startup = time.monotonic()
     args = parse_args(argv)
+    expected_config = config_hash(args)
+    from pathlib import Path
+    source_root = Path(__file__).resolve().parent
+    source_fingerprints = {str(path.relative_to(source_root)): checkpointing.file_hash(path)
+                           for path in [source_root/"train_grpo.py", *sorted((source_root/"rl").glob("*.py"))]}
     out = os.path.join(args.out_root, args.run)
     ckpt_dir = os.path.join(out, "ckpt")
     if os.path.exists(os.path.join(out, "metrics.jsonl")) and not args.resume:
         raise SystemExit(f"{out} already has a run. Use --resume to continue it, or a new --run name.")
     os.makedirs(out, exist_ok=True)
     torch.manual_seed(args.seed)
-    device = "cuda"
+    device = _test_device or "cuda"
 
-    tok = AutoTokenizer.from_pretrained(args.model)
+    tok = AutoTokenizer.from_pretrained(args.model, revision=args.model_revision)
     tok.padding_side = "left"
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).to(device)
+    model = AutoModelForCausalLM.from_pretrained(args.model, revision=args.model_revision, dtype=torch.bfloat16).to(device)
     model = get_peft_model(model, LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha,
                                              target_modules="all-linear", lora_dropout=0.0))
+    if args.campaign_id:
+        checkpointing.atomic_json(os.path.join(out, "model-setup.json"), assert_model_setup(model))
     if not args.no_grad_ckpt:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.config.use_cache = True                  # generate() needs the KV cache; training passes use_cache=False
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"LoRA params: {n_train / 1e6:.2f}M")
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr,
-                            betas=(0.9, 0.99), weight_decay=0.0)
+                            betas=(0.9, 0.99), eps=1e-8, weight_decay=0.0)
     # Constant LR after a short linear warmup: step 1 uses lr/warmup, step `warmup` the full lr.
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / args.warmup) if args.warmup else 1.0)
 
-    train = load_gsm8k("train")
+    train = load_gsm8k("train", revision=args.data_revision)
     if args.overfit:
         keep = pick_overfit_questions(train, args.overfit)
         train = [train[i] for i in keep]
         args.no_dynamic, args.questions = True, args.overfit
     stream = QuestionStream(train, args.seed)
     reward_gen = torch.Generator().manual_seed(args.seed + 12345)
-    test = load_gsm8k("test")
+    test = load_gsm8k("test", revision=args.data_revision)
     g = torch.Generator().manual_seed(1234)                       # fixed subsets for every run
     perm = torch.randperm(len(test), generator=g).tolist()
     eval_set = [test[i] for i in (perm[:args.eval_n] if args.eval_n else range(len(test)))]
     passk_set = [test[i] for i in perm[:args.passk_n]]
 
-    start, prev_elapsed, wandb_id = 0, 0.0, None
-    if args.resume and (os.path.exists(ckpt_dir) or os.path.exists(ckpt_dir + ".old")):
-        st = load_checkpoint(ckpt_dir, model, opt, sched, stream, reward_gen)
+    lineage = {}
+    initial_params = [p.detach().clone() for p in model.parameters() if p.requires_grad]
+    start, attempt, empty_attempts, gap_strikes, prev_elapsed, wandb_id = 0, 0, 0, 0, 0.0, None
+    if args.resume:
+        st = load_checkpoint(ckpt_dir, model, opt, sched, stream, reward_gen, expected_config)
         start, prev_elapsed, wandb_id = st["step"], st["elapsed"], st.get("wandb_id")
-        trim_logs(out, start)
+        if st.get("source_hashes") != source_fingerprints:
+            raise ValueError("checkpoint source hash mismatch")
+        attempt = st.get("attempt", start)
+        empty_attempts, gap_strikes = st.get("empty_attempts", 0), st.get("gap_strikes", 0)
+        initial_params = [p.to(device) for p in st.get("initial_params", initial_params)]
+        lineage = st.get("log_lineage", {})
+        if lineage:
+            checkpointing.restore_logs(out, lineage)
+        else:
+            trim_logs(out, start)
         print(f"resumed from step {start}")
     json.dump(vars(args), open(os.path.join(out, "config.json"), "w"), indent=2)
 
-    engine = make_engine(args.engine, model, tok, args, out)       # vLLM gets the (resumed) adapter
+    with isolated_rng():
+        engine = make_engine(args.engine, model, tok, args, out)       # vLLM gets the (resumed) adapter
     wb = None
     if args.wandb:
         import wandb
-        wandb_id = wandb_id or uuid.uuid4().hex[:8]
-        wb = wandb.init(project=args.wandb_project, name=args.run, id=wandb_id, resume="allow", config=vars(args))
+        wandb_id = uuid.uuid4().hex[:8]
+        wb = wandb.init(project=args.wandb_project, name=args.run + "/" + wandb_id, id=wandb_id,
+                        group=(args.campaign_id or "legacy") + "/" + args.run, config=vars(args),
+                        settings=wandb.Settings(init_timeout=60))
         table_rows = []
 
-    files = {"hard": open(os.path.join(out, "hard.jsonl"), "a"),
-             "samples": gzip.open(os.path.join(out, "samples.jsonl.gz"), "at")}
+    attempt_id = wandb_id or uuid.uuid4().hex[:8]
+    raw = os.path.join(out, "attempts", attempt_id)
+    os.makedirs(raw, exist_ok=False)
+    raw_metrics = checkpointing.ChunkLog(os.path.join(raw, "metrics"))
+    raw_samples = checkpointing.ChunkLog(os.path.join(raw, "samples"))
+    raw_hard = checkpointing.ChunkLog(os.path.join(raw, "hard"))
+    files = {"hard": checkpointing.MirrorLog(open(os.path.join(out, "hard.jsonl"), "a"), raw_hard),
+             "samples": checkpointing.MirrorLog(gzip.open(os.path.join(out, "samples.jsonl.gz"), "at"), raw_samples)}
     log = open(os.path.join(out, "metrics.jsonl"), "a")
     t_start = time.time()
+    telemetry_failed_at = None
+    last_telemetry_check = 0.0
+
+    def checkpoint(step):
+        save_started = time.monotonic()
+        for f in (*files.values(), log, raw_metrics):
+            f.flush()
+        lineage[attempt_id] = {"metrics": raw_metrics.index, "samples": raw_samples.index, "hard": raw_hard.index}
+        save_checkpoint(ckpt_dir, model, opt, sched, stream, reward_gen, step,
+                        {"elapsed": prev_elapsed + time.time() - t_start, "wandb_id": wandb_id,
+                         "attempt": attempt, "empty_attempts": empty_attempts, "gap_strikes": gap_strikes,
+                         "config_hash": expected_config, "source_hashes": source_fingerprints, "attempt_id": attempt_id,
+                         "initial_params": [p.cpu() for p in initial_params],
+                         "committed_log_chunks": raw_metrics.index, "log_lineage": lineage}, commit=on_checkpoint)
+        checkpointing.atomic_json(os.path.join(raw, "checkpoint-timing", f"step{step}.json"),
+                                  {"step": step, "seconds": time.monotonic() - save_started})
+
+
+    def emit_wandb(values, step):
+        nonlocal telemetry_failed_at, last_telemetry_check
+        if not wb:
+            return
+        now = time.monotonic()
+        try:
+            wb.log({**values, "successful_update": step}, step=attempt)
+            # log() queues asynchronously, so success alone cannot prove connectivity.
+            if now - last_telemetry_check >= 60:
+                import wandb
+                last_telemetry_check = now
+                wandb.Api(timeout=5).run(wb.path)
+                telemetry_failed_at = None
+        except Exception as error:
+            telemetry_failed_at = telemetry_failed_at or now
+            checkpointing.atomic_json(os.path.join(raw, "telemetry-failure.json"),
+                                      {"step": step, "type": type(error).__name__, "message": str(error)})
+        if telemetry_failed_at is not None and now - telemetry_failed_at >= 600:
+            checkpoint(step)
+            raise RuntimeError("W&B unavailable for ten minutes")
 
     def write(rec):
+        rec["attempt_id"] = attempt_id
+        rec["rollout_attempt"] = attempt
+        raw_metrics.write(json.dumps(rec, allow_nan=False) + "\n")
+        raw_metrics.flush()
         log.write(json.dumps(rec) + "\n")
         log.flush()
-        if wb:
-            wb.log({k: v for k, v in rec.items() if isinstance(v, (int, float)) and k not in ("step", "type")},
-                   step=rec["step"])
+        emit_wandb({k: v for k, v in rec.items() if isinstance(v, (int, float)) and k not in ("step", "type")}, rec["step"])
 
     def evaluate(step):
         t0 = time.time()
-        ev, correct = greedy_eval(engine, model, eval_set)
+        with isolated_rng():
+            ev, correct, records = greedy_eval(engine, model, eval_set, return_records=True)
         os.makedirs(os.path.join(out, "evals"), exist_ok=True)
-        json.dump({"step": step, "n": len(correct), "correct": correct}, open(os.path.join(out, "evals", f"step{step}.json"), "w"))
+        eval_record = {"records": records, "step": step, "n": len(correct), "correct": correct, "ids": [p.get("id", i) for i, p in enumerate(eval_set)]}
+        checkpointing.atomic_json(os.path.join(raw, "evals", f"step{step}.json"), eval_record)
+        checkpointing.atomic_json(os.path.join(out, "evals", f"step{step}.json"), eval_record)
         write({"type": "eval", "step": step, **ev, "t": time.time() - t0})
         print(f"[eval] step {step} acc={ev['eval_acc']:.3f} len={ev['eval_len']:.0f} ({time.time() - t0:.0f}s)")
 
     def passk(step, tag):
         t0 = time.time()
-        pk = passk_eval(engine, model, passk_set, args.passk_k, args.temperature)
+        with isolated_rng():
+            pk = passk_eval(engine, model, passk_set, args.passk_k, args.temperature)
         write({"type": "passk", "step": step, "when": tag, **{f"test_{k}": v for k, v in pk.items()},
                "t": time.time() - t0})
         print(f"[pass@k] {tag}: " + " ".join(f"{k}={v:.3f}" for k, v in pk.items()))
 
+    if not args.resume:
+        model.save_pretrained(os.path.join(out, "adapters", "step0"))
+        checkpoint(0)
+    write({"type": "startup", "step": start, "seconds": time.monotonic() - startup})
     if start == 0:
         if args.eval_every:
             evaluate(0)
         if args.passk_n:
             passk(0, "start")
 
-    for step in range(start + 1, args.steps + 1):
-        torch.cuda.reset_peak_memory_stats()
+    step = start
+    while step < args.steps:
+        if guard:
+            try:
+                guard()
+            except TimeoutError:
+                checkpoint(step)
+                for handle in (*files.values(), log, raw_metrics):
+                    handle.close()
+                if wb:
+                    wb.finish()
+                if on_checkpoint:
+                    on_checkpoint()
+                raise
+        if attempt >= args.max_attempts or empty_attempts >= args.max_empty_attempts:
+            checkpoint(step)
+            raise RuntimeError("no-signal stop: rollout attempt limit reached")
+        attempt += 1
+        if device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
         model.eval()
-        groups, st = sample_groups(engine, stream, train, args, step, files, reward_gen)
+        args.current_update = step + 1
+        groups, st = sample_groups(engine, stream, train, args, attempt, files, reward_gen)
         engine.release()
         t_gen = time.time() - t0
         rec = {"type": "train", "step": step}
@@ -471,26 +600,41 @@ def main(argv=None, on_checkpoint=None):
             "all_wrong_frac": sum(c == 0 for c in nr) / len(nr),
             "rounds": st["rounds"], "t_rounds": st["t_rounds"], "n_groups": len(groups),
             "len": sum(s["length"] for s in s0) / len(s0),
-            "len_right": sum(s["length"] for s in s0 if s["correct"]) / max(1, sum(s["correct"] for s in s0)),
-            "len_wrong": sum(s["length"] for s in s0 if not s["correct"]) / max(1, sum(not s["correct"] for s in s0)),
-            "len_finished": sum(fin) / max(1, len(fin)),
+            "len_right": sum(s["length"] for s in s0 if s["correct"]) / sum(s["correct"] for s in s0) if any(s["correct"] for s in s0) else None,
+            "len_wrong": sum(s["length"] for s in s0 if not s["correct"]) / sum(not s["correct"] for s in s0) if any(not s["correct"] for s in s0) else None,
+            "len_finished": sum(fin) / len(fin) if fin else None,
             "len_min": min(s["length"] for s in s0), "len_max": max(s["length"] for s in s0),
             "trunc_frac": sum(s["truncated"] for s in s0) / len(s0),
             "n_right": nr,
             "questions_seen": stream.seen,
+            "generated_tokens": st["generated_tokens"], "generated_answers": st["generated_answers"],
+            "format_fraction": sum(s["formatted"] for s in s0) / len(s0),
+            "shortfall_groups": args.questions - len(groups),
         })
+        if not groups:
+            empty_attempts += 1
+            rec["type"] = "empty_attempt"
+            write(rec)
+            continue
+        empty_attempts = 0
         if groups:
+            args.current_update = step + 1
             model.train()
             t1 = time.time()
             rec.update(train_step(model, opt, sched, groups, args, device, tok.pad_token_id))
             rec["t_train"] = time.time() - t1
+            step += 1
+            rec["step"] = step
+            params_now = [p for p in model.parameters() if p.requires_grad]
+            rec["parameter_rms_from_initial"] = (sum((p.detach() - b).double().square().sum().item() for p, b in zip(params_now, initial_params)) / sum(p.numel() for p in params_now)) ** 0.5
+            gap_strikes = gap_strikes + 1 if rec.get("gap_abs", 0) > 0.05 else 0
         t2 = time.time()
         engine.sync(step)                                           # next samples come from the new policy
         rec["t_sync"] = time.time() - t2
         elapsed = prev_elapsed + time.time() - t_start
         rec.update({"t_gen": t_gen, "t_step": time.time() - t0, "hours": elapsed / 3600,
                     "dollars": elapsed / 3600 * args.price_per_hour,
-                    "vram_gb": torch.cuda.max_memory_allocated() / 2**30})
+                    "vram_gb": torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else None})
         write(rec)
         if wb:
             table_rows += [[step, qi, s["reward"], int(s["correct"]), s["length"], s["text"]]
@@ -498,28 +642,29 @@ def main(argv=None, on_checkpoint=None):
         print(f"step {step:4d} | acc {rec['acc']:.3f} | wasted {rec['wasted_frac']:.2f} r{rec['rounds']} "
               f"| len {rec['len']:.0f} | kl {rec.get('kl', 0):.4f} | H {rec.get('entropy', 0):.3f}/"
               f"{rec.get('entropy_top', 0):.3f} | gn {rec.get('grad_norm', 0):.3f} "
-              f"| {rec['t_gen']:.0f}s+{rec.get('t_train', 0):.0f}s | {rec['vram_gb']:.1f}GB", flush=True)
+              f"| {rec['t_gen']:.0f}s+{rec.get('t_train', 0):.0f}s | {rec['vram_gb']}GB", flush=True)
         for v in ("loss", "kl", "grad_norm"):
             assert v not in rec or rec[v] == rec[v], f"NaN in {v} at step {step}"
 
+        if gap_strikes >= 3:
+            checkpoint(step)
+            raise RuntimeError("sampler gap exceeded 0.05 for three consecutive updates")
         if args.eval_every and (step % args.eval_every == 0 or step == args.steps):
             evaluate(step)
-            model.save_pretrained(os.path.join(out, "adapters", f"step{step}"))
             if wb:
                 import wandb
-                wb.log({"samples": wandb.Table(columns=["step", "question", "reward", "correct", "length", "answer"],
-                                               data=table_rows)}, step=step)
+                emit_wandb({"samples": wandb.Table(columns=["step", "question", "reward", "correct", "length", "answer"],
+                                               data=table_rows)}, step)
+                table_rows.clear()
         if args.ckpt_every and (step % args.ckpt_every == 0 or step == args.steps):
-            save_checkpoint(ckpt_dir, model, opt, sched, stream, reward_gen, step,
-                            {"elapsed": prev_elapsed + time.time() - t_start, "wandb_id": wandb_id})
-            if on_checkpoint:
-                on_checkpoint()
+            model.save_pretrained(os.path.join(out, "adapters", f"step{step}"))
+            checkpoint(step)
 
     end_logged = any('"when": "end"' in l for l in open(os.path.join(out, "metrics.jsonl")))
     if args.passk_n and not end_logged:                  # also after a crash between the last checkpoint and here
         passk(args.steps, "end")
     model.save_pretrained(os.path.join(out, "adapter"))
-    for f in (*files.values(), log):
+    for f in (*files.values(), log, raw_metrics):
         f.close()
     if wb:
         wb.finish()

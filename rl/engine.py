@@ -24,6 +24,7 @@ import tempfile
 import torch
 
 from rl.data import build_prompt, eos_ids_of
+from rl.campaign import isolated_rng
 from rl.eval import gen_config, generate
 from rl.rollout import completion_masks, rollout
 
@@ -71,7 +72,27 @@ class HFEngine:
     def release(self):
         pass
 
-    def sample(self, problems, k, temperature):
+    def sample(self, problems, k, temperature, requests=None):
+        if requests is not None:
+            if len(requests) != len(problems):
+                raise ValueError("request count mismatch")
+            prompts, comps, finished, logprobs = [], [], [], []
+            has_logprobs = False
+            for problem, request in zip(problems, requests):
+                with isolated_rng(request["seed"]):
+                    ro = self.sample([problem], k, temperature)
+                P = ro["prompt_len"]
+                prompts.append(ro["input_ids"][0, :P][ro["attention_mask"][0, :P].bool()].tolist())
+                for i in range(k):
+                    comps.append(ro["input_ids"][i, P:P+int(ro["lengths"][i])].tolist())
+                    finished.append(not bool(ro["truncated"][i]))
+                    has_logprobs = "sample_logp" in ro
+                    logprobs.append(ro["sample_logp"][i, :int(ro["lengths"][i])].tolist() if has_logprobs else [0.] * int(ro["lengths"][i]))
+            packed = pack_completions(prompts, comps, logprobs, finished, k, self.tok, self.eos_ids)
+            if not has_logprobs:
+                del packed["sample_logp"]
+            packed["requests"] = requests
+            return packed
         cfg = gen_config(self.model, True, temperature, self.max_new_tokens)
         return rollout(self.model, self.tok, problems, k, cfg, self.prompt_style, self.gen_batch)
 
@@ -87,7 +108,7 @@ class VLLMEngine:
     None for evaluation, where `adapter_dir` is an already-saved adapter (or None = base model)."""
 
     def __init__(self, model, tok, model_name, max_new_tokens, prompt_style="boxed", adapter_dir=None,
-                 gpu_memory_utilization=0.3, max_lora_rank=64, seed=0, sleep=False, max_loras=1):
+                 gpu_memory_utilization=0.3, max_lora_rank=64, seed=0, sleep=False, max_loras=1, revision=None):
         # Run vLLM's engine inside this process. The trainer has already started CUDA, and a
         # separate engine process would then have to be spawned (re-importing the caller).
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -101,9 +122,9 @@ class VLLMEngine:
         self.model, self.tok = model, tok
         self.max_new_tokens, self.prompt_style = max_new_tokens, prompt_style
         self.eos_ids = eos_ids_of(model.generation_config if model is not None
-                                  else GenerationConfig.from_pretrained(model_name))
+                                  else GenerationConfig.from_pretrained(model_name, revision=revision))
         self.adapter_dir, self.sleep_between = adapter_dir, sleep
-        self.llm = LLM(model=model_name, dtype="bfloat16", enable_lora=True, max_lora_rank=max_lora_rank,
+        self.llm = LLM(model=model_name, revision=revision, tokenizer_revision=revision, dtype="bfloat16", enable_lora=True, max_lora_rank=max_lora_rank,
                        max_loras=max_loras, gpu_memory_utilization=gpu_memory_utilization, seed=seed,
                        generation_config="vllm", max_model_len=1024, enable_sleep_mode=sleep)
         self.lora, self.asleep = None, False
@@ -134,9 +155,9 @@ class VLLMEngine:
             self.llm.sleep(level=1)
             self.asleep = True
 
-    def _params(self, n, temperature, logprobs):
+    def _params(self, n, temperature, logprobs, seed=None):
         from vllm import SamplingParams
-        return SamplingParams(n=n, temperature=temperature, top_p=1.0, top_k=-1, min_p=0.0,
+        return SamplingParams(n=n, temperature=temperature, seed=seed, top_p=1.0, top_k=-1, min_p=0.0,
                               repetition_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0,
                               max_tokens=self.max_new_tokens, stop_token_ids=self.eos_ids,
                               logprobs=0 if logprobs else None, skip_special_tokens=True)
@@ -149,9 +170,13 @@ class VLLMEngine:
                                  lora_request=self.lora, use_tqdm=False)
         return prompt_ids, outs
 
-    def sample(self, problems, k, temperature):
+    def sample(self, problems, k, temperature, requests=None):
         """Same dict as rl.rollout.rollout, plus sample_logp [N, T] (vLLM's log p of each sampled token)."""
-        prompt_ids, outs = self._run(problems, self._params(k, temperature, logprobs=True))
+        if requests is not None and len(requests) != len(problems):
+            raise ValueError("request count mismatch")
+        params = ([self._params(k, temperature, True, req["seed"]) for req in requests]
+                  if requests is not None else self._params(k, temperature, True))
+        prompt_ids, outs = self._run(problems, params)
         comps, lps, finished = [], [], []
         for out in outs:                                      # rows grouped by prompt: row i*k + j
             assert len(out.outputs) == k
@@ -160,7 +185,10 @@ class VLLMEngine:
                 comps.append(ids)
                 lps.append([d[t].logprob for t, d in zip(ids, c.logprobs)])
                 finished.append(c.finish_reason == "stop")
-        return pack_completions(prompt_ids, comps, lps, finished, k, self.tok, self.eos_ids)
+        packed = pack_completions(prompt_ids, comps, lps, finished, k, self.tok, self.eos_ids)
+        if requests is not None:
+            packed["requests"] = requests
+        return packed
 
     def greedy(self, problems, batch_size=None):
         _, outs = self._run(problems, self._params(1, 0.0, logprobs=False))
@@ -171,7 +199,8 @@ class VLLMEngine:
             _, lengths, truncated = completion_masks(ids, self.eos_ids)
             assert (c.finish_reason == "stop") == (not bool(truncated[0])), "stop reason disagrees with the EOS scan"
             rows.append({"text": self.tok.decode(c.token_ids, skip_special_tokens=True),
-                         "length": int(lengths[0]) if c.token_ids else 0, "truncated": bool(truncated[0])})
+                         "length": int(lengths[0]) if c.token_ids else 0, "truncated": bool(truncated[0]),
+                         "token_ids": list(c.token_ids), "finish_reason": c.finish_reason})
         return rows
 
 
@@ -184,5 +213,5 @@ def make_engine(kind, model, tok, args, out_dir):
         return VLLMEngine(model, tok, args.model, args.max_new_tokens, args.prompt,
                           adapter_dir=tempfile.mkdtemp(prefix="vllm_adapter_"),
                           gpu_memory_utilization=args.vllm_mem, max_lora_rank=max(8, args.lora_r), seed=args.seed,
-                          sleep=args.vllm_sleep)
+                          sleep=args.vllm_sleep, revision=getattr(args, "model_revision", None))
     raise ValueError(kind)

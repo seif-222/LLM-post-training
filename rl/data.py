@@ -6,6 +6,7 @@ Each problem is {"question": str, "answer": float, "solution": str}.
 it's kept only for inspecting failures.
 """
 import re
+import math
 from datasets import load_dataset
 
 # Two answer formats. "hash" matches GSM8K's own "#### <n>"; "boxed" is what Qwen2.5 was
@@ -35,14 +36,19 @@ def extract_final_answer(solution_text):
     """GSM8K solutions end with '#### <number>' -- pull that number out as a float."""
     match = re.search(r"####\s*(-?[\d,]+(?:\.\d+)?)", solution_text)
     assert match, f"couldn't find '#### <number>' in: {solution_text!r}"
-    return float(match.group(1).replace(',', ''))
+    value = float(match.group(1).replace(',', ''))
+    if not math.isfinite(value):
+        raise ValueError('nonfinite gold answer')
+    return value
 
 
-def load_gsm8k(split):
+def load_gsm8k(split, revision=None):
     """split: 'train' (7,473) or 'test' (1,319)."""
-    ds = load_dataset("openai/gsm8k", "main", split=split)
-    return [{"question": r["question"], "answer": extract_final_answer(r["answer"]), "solution": r["answer"]}
-            for r in ds]
+    ds = load_dataset("openai/gsm8k", "main", split=split, revision=revision)
+    if revision and (not ds.cache_files or any(revision not in f["filename"] for f in ds.cache_files)):
+        raise ValueError("GSM8K cache does not prove the requested pinned revision")
+    return [{"id": i, "question": r["question"], "answer": extract_final_answer(r["answer"]), "solution": r["answer"]}
+            for i, r in enumerate(ds)]
 
 
 def build_prompt(tokenizer, question, style="hash"):

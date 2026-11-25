@@ -9,6 +9,10 @@ Thin lines are raw per-step values; thick lines are a rolling mean (--smooth ste
 import argparse
 import json
 import os
+import sys
+from pathlib import Path
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import matplotlib
 matplotlib.use("Agg")
@@ -46,10 +50,16 @@ def rolling(y, w):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("runs", nargs="+")
+    ap.add_argument("runs", nargs="*")
+    ap.add_argument("--campaign-root", help="campaign folder containing training/<logical-run>/metrics.jsonl")
     ap.add_argument("--smooth", type=int, default=10)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    if args.campaign_root:
+        plot_campaign_training(args.campaign_root, args.out)
+        return
+    if not args.runs:
+        ap.error("runs or --campaign-root required")
     data = {r: load(r) for r in args.runs}
     multi = len(args.runs) > 1
 
@@ -59,7 +69,7 @@ def main():
             train, evals = data[run]
             for si, (key, label) in enumerate(series):
                 rows = evals if key.startswith("eval") else train
-                pts = [(r["step"], r[key]) for r in rows if key in r]
+                pts = [(r["step"], r[key]) for r in rows if key in r and r[key] is not None]
                 if not pts:
                     continue
                 x, y = zip(*pts)
@@ -86,6 +96,44 @@ def main():
     out = args.out or os.path.join("runs", "grpo", args.runs[0], "plots.png")
     fig.savefig(out, dpi=110)
     print(out)
+
+
+
+
+
+def plot_campaign_comparison(result, output):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    models = list(dict.fromkeys(row['model'] for row in result['table'] if not row['model'].endswith('_mean')))
+    for model in models:
+        rows = [r for r in result['table'] if r['model'] == model]
+        ax.plot([r['k'] for r in rows],[r['score'] for r in rows],marker='o',label=model,
+                linestyle='--' if model.endswith('_s1') else '-')
+    ax.set(xlabel='Number of attempts (k)',ylabel='Pass@k',ylim=(0,1))
+    ax.set_xscale('log',base=2)
+    ax.grid(alpha=.25);ax.legend(fontsize=8)
+    fig.tight_layout();fig.savefig(output,dpi=160);plt.close(fig)
+
+
+def plot_campaign_training(root, output=None):
+    from pathlib import Path
+    # The canonical metrics views are rebuilt from checkpoint lineage on resume.
+    from rl.campaign import RUNS
+    panels = [('eval_acc','Greedy accuracy'),('entropy','Full entropy'),('entropy_top','Top-90% entropy'),
+              ('objective_kl','Objective-weighted KL'),('parameter_rms_change','RMS parameter movement'),
+              ('parameter_rms_from_initial','RMS displacement from initialization'),
+              ('policy_grad_norm','Policy gradient norm'),('weighted_kl_grad_norm','Weighted KL gradient norm'),
+              ('policy_kl_alignment','Policy/KL gradient alignment'),('grad_norm','Pre-clip gradient norm'),
+              ('gap_abs','Absolute sampler/trainer gap'),('t_step','Seconds per update')]
+    fig, axes=plt.subplots(4,3,figsize=(15,15))
+    for i,run in enumerate(RUNS):
+        path=Path(root)/'training'/run/'metrics.jsonl'
+        rows=[json.loads(line) for line in path.open()]
+        for ax,(key,title) in zip(axes.flat,panels):
+            pts=[(r['step'],r[key]) for r in rows if r.get(key) is not None]
+            if pts:ax.plot(*zip(*pts),color=COLORS[i%3],linestyle='--' if run.endswith('_s1') else '-',label=run)
+            ax.set(title=title,xlabel='Successful update');ax.grid(alpha=.2)
+    axes.flat[0].legend(fontsize=8)
+    fig.tight_layout();fig.savefig(output or str(Path(root)/'training-trajectories.png'),dpi=160);plt.close(fig)
 
 
 if __name__ == "__main__":
